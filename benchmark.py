@@ -4,6 +4,7 @@ Benchmark: Zero-Copy Shared Memory Libraries for Python
 Compares:
   1. multiprocessing.shared_memory (stdlib)
   2. SharedArray (C extension)
+  3. shmem SharedStore (this library)
 
 Measures:
   - Write latency: time to copy a numpy array into shared memory
@@ -27,12 +28,17 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
+from shmem import SharedStore
+
 try:
     import SharedArray as sa
 
     HAS_SHARED_ARRAY = True
 except ImportError:
     HAS_SHARED_ARRAY = False
+
+STORE_NAME = "bench_shmem"
+STORE_SIZE_MB = 256
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +159,43 @@ def bench_shared_array_latency(shape, image):
 
 
 # ---------------------------------------------------------------------------
-# 3. Cross-process throughput
+# 3. shmem SharedStore latency
+# ---------------------------------------------------------------------------
+
+
+def bench_shmem_latency(shape, image):
+    store = SharedStore.create(STORE_NAME, size_mb=STORE_SIZE_MB, max_entries=64)
+
+    write_times = []
+    read_times = []
+
+    try:
+        for _ in range(WARMUP_ITERS):
+            store.put("bench", image)
+            store.get("bench")
+
+        for _ in range(BENCH_ITERS):
+            t0 = time.perf_counter_ns()
+            store.put("bench", image)
+            t1 = time.perf_counter_ns()
+            write_times.append((t1 - t0) / 1000)
+
+        for _ in range(BENCH_ITERS):
+            t0 = time.perf_counter_ns()
+            arr = store.get("bench")
+            t1 = time.perf_counter_ns()
+            read_times.append((t1 - t0) / 1000)
+        del arr
+
+        store.delete("bench")
+    finally:
+        store.destroy()
+
+    return write_times, read_times
+
+
+# ---------------------------------------------------------------------------
+# 4. Cross-process throughput
 # ---------------------------------------------------------------------------
 
 
@@ -264,6 +306,67 @@ def bench_sa_throughput(shape):
     return n / elapsed, elapsed, n
 
 
+def _shmem_producer(store_name, locks, max_entries, shape, ready, start, n):
+    store = SharedStore.connect(store_name, locks, max_entries)
+    frame = make_image(shape)
+    ready.set()
+    start.wait()
+    for _ in range(n):
+        store.put("frame", frame)
+    store.close()
+
+
+def _shmem_consumer(store_name, locks, max_entries, shape, ready, start, done, n):
+    store = SharedStore.connect(store_name, locks, max_entries)
+    sink = np.empty(shape, dtype=DTYPE)
+    ready.set()
+    start.wait()
+    for _ in range(n):
+        arr = store.get("frame")
+        if arr is not None:
+            np.copyto(sink, arr)
+    del arr
+    done.set()
+    store.close()
+
+
+def bench_shmem_throughput(shape):
+    store = SharedStore.create(STORE_NAME, size_mb=STORE_SIZE_MB, max_entries=64)
+    # Pre-populate so consumer never sees None
+    store.put("frame", make_image(shape))
+
+    n = THROUGHPUT_FRAMES
+    prod_ready, cons_ready = mp.Event(), mp.Event()
+    start, done = mp.Event(), mp.Event()
+
+    try:
+        p = mp.Process(
+            target=_shmem_producer,
+            args=(STORE_NAME, store.locks(), 64, shape, prod_ready, start, n),
+        )
+        c = mp.Process(
+            target=_shmem_consumer,
+            args=(STORE_NAME, store.locks(), 64, shape, cons_ready, start, done, n),
+        )
+        p.start()
+        c.start()
+        prod_ready.wait()
+        cons_ready.wait()
+
+        t0 = time.perf_counter()
+        start.set()
+        done.wait()
+        t1 = time.perf_counter()
+
+        p.join(timeout=10)
+        c.join(timeout=10)
+        elapsed = t1 - t0
+    finally:
+        store.destroy()
+
+    return n / elapsed, elapsed, n
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -288,6 +391,9 @@ def run_latency():
         if HAS_SHARED_ARRAY:
             w, r = bench_shared_array_latency(shape, image)
             methods["SharedArray"] = (w, r)
+
+        w, r = bench_shmem_latency(shape, image)
+        methods["shmem SharedStore"] = (w, r)
 
         header = f"  {'Method':<25} {'Write (med)':>12} {'Write (p99)':>12} {'Read (med)':>12} {'Read (p99)':>12}"
         print(header)
@@ -322,6 +428,10 @@ def run_throughput():
             bw = fps * nbytes / 1e9
             print(f"  {'SharedArray':<25} {fps:>10.1f} {elapsed:>10.3f} {bw:>11.2f} GB/s")
 
+        fps, elapsed, n = bench_shmem_throughput(shape)
+        bw = fps * nbytes / 1e9
+        print(f"  {'shmem SharedStore':<25} {fps:>10.1f} {elapsed:>10.3f} {bw:>11.2f} GB/s")
+
 
 def main():
     print()
@@ -341,11 +451,13 @@ def main():
     print("NOTES")
     print("=" * 80)
     print("""
-  - 'Write' = time to memcpy a numpy array INTO the shared region
+  - 'Write' = time to copy a numpy array INTO the shared region
   - 'Read'  = time to create a zero-copy ndarray VIEW on shared memory
     (no data is copied or deserialized — it's just a pointer + metadata)
-  - Throughput = producer writes full frames, consumer touches data
-    to confirm it's accessible. No synchronization between them.
+  - stdlib/SharedArray: write = raw memcpy, read = pointer wrap
+  - SharedStore: write = key lookup + alloc + memcpy, read = key lookup + pointer wrap
+  - Throughput: producer writes full frames, consumer reads (memcpy to sink).
+    stdlib/SharedArray have no synchronization; SharedStore uses rw-locks.
 """)
 
 
