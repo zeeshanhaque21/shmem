@@ -1,0 +1,19 @@
+[project]
+name = "shmem"
+version = "0.1.0"
+description = "Zero-copy shared memory key-value store for numpy arrays and raw bytes"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4.2",
+    "pytest>=9.0.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
