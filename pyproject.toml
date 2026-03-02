@@ -3,7 +3,7 @@ name = "shmem"
 version = "0.1.0"
 description = "Zero-copy shared memory key-value store for numpy arrays and raw bytes"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.0",
 ]
