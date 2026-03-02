@@ -350,11 +350,9 @@ class SharedStore:
         if entry is None:
             return None
 
-        dtype = np.dtype(entry.dtype_str.rstrip(b"\x00").decode("utf-8"))
-        shape = tuple(entry.shape[i] for i in range(entry.ndim))
-
+        dtype = np.dtype(entry.dtype_str.rstrip(b"\x00"))
         arr = np.ndarray(
-            shape,
+            entry.shape,
             dtype=dtype,
             buffer=self._data_buf,
             offset=entry.data_offset,
