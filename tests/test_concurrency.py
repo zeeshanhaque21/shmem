@@ -5,20 +5,21 @@ import numpy as np
 import pytest
 from shmem import SharedStore
 
+
 STORE_NAME = "test_concurrent"
 
 
 @pytest.fixture
 def store():
-    s = SharedStore.create(STORE_NAME, size_mb=4, max_entries=256)
+    s = SharedStore.create(STORE_NAME, chunk_size_mb=1, max_entries=256)
     yield s
     s.destroy()
 
 
-def _reader_worker(name, locks, max_entries, key, expected_sum, results, idx):
+def _reader_worker(name, locks, key, expected_sum, results, idx):
     """Child process: connect, read a key, verify checksum."""
     try:
-        s = SharedStore.connect(name, locks, max_entries)
+        s = SharedStore.connect(name, locks)
         arr = s.get(key)
         if arr is not None and arr.sum() == expected_sum:
             results[idx] = 1
@@ -42,7 +43,7 @@ def test_concurrent_readers(store):
     for i in range(n_readers):
         p = multiprocessing.Process(
             target=_reader_worker,
-            args=(STORE_NAME, store.locks(), 256, "shared_data", expected_sum, results, i),
+            args=(STORE_NAME, store.locks(), "shared_data", expected_sum, results, i),
         )
         procs.append(p)
         p.start()
@@ -54,10 +55,10 @@ def test_concurrent_readers(store):
         assert results[i] == 1, f"Reader {i} failed (result={results[i]})"
 
 
-def _writer_worker(name, locks, max_entries, key, value, done_flag):
+def _writer_worker(name, locks, key, value, done_flag):
     """Child process: connect and write a value."""
     try:
-        s = SharedStore.connect(name, locks, max_entries)
+        s = SharedStore.connect(name, locks)
         arr = np.full(100, value, dtype=np.float64)
         s.put(key, arr)
         s.close()
@@ -75,7 +76,7 @@ def test_writer_exclusion(store):
     for i in range(n_writers):
         p = multiprocessing.Process(
             target=_writer_worker,
-            args=(STORE_NAME, store.locks(), 256, f"key_{i}", float(i), done_flags[i]),
+            args=(STORE_NAME, store.locks(), f"key_{i}", float(i), done_flags[i]),
         )
         procs.append(p)
         p.start()
@@ -93,10 +94,10 @@ def test_writer_exclusion(store):
         np.testing.assert_array_equal(arr, np.full(100, float(i), dtype=np.float64))
 
 
-def _stress_worker(name, locks, max_entries, worker_id, n_ops, results_flag):
+def _stress_worker(name, locks, worker_id, n_ops, results_flag):
     """Stress test: each worker writes and reads its own keys."""
     try:
-        s = SharedStore.connect(name, locks, max_entries)
+        s = SharedStore.connect(name, locks)
         for j in range(n_ops):
             key = f"w{worker_id}_k{j}"
             arr = np.full(50, worker_id * 1000 + j, dtype=np.int32)
@@ -125,7 +126,7 @@ def test_stress_concurrent_rw(store):
     for i in range(n_workers):
         p = multiprocessing.Process(
             target=_stress_worker,
-            args=(STORE_NAME, store.locks(), 256, i, n_ops, flags[i]),
+            args=(STORE_NAME, store.locks(), i, n_ops, flags[i]),
         )
         procs.append(p)
         p.start()
@@ -137,10 +138,10 @@ def test_stress_concurrent_rw(store):
         assert flags[i].value == 1, f"Stress worker {i} failed"
 
 
-def _child_put_and_delete(name, locks, max_entries, done_flag):
+def _child_put_and_delete(name, locks, done_flag):
     """Child writes a key, reads it, deletes it."""
     try:
-        s = SharedStore.connect(name, locks, max_entries)
+        s = SharedStore.connect(name, locks)
         arr = np.array([42, 43, 44], dtype=np.int32)
         s.put("child_key", arr)
         result = s.get("child_key")
@@ -159,8 +160,52 @@ def test_child_full_lifecycle(store):
     flag = multiprocessing.Value("i", 0)
     p = multiprocessing.Process(
         target=_child_put_and_delete,
-        args=(STORE_NAME, store.locks(), 256, flag),
+        args=(STORE_NAME, store.locks(), flag),
     )
     p.start()
     p.join(timeout=10)
     assert flag.value == 1
+
+
+def _growth_worker(name, locks, worker_id, done_flag):
+    """Child that puts large arrays to trigger chunk growth."""
+    try:
+        s = SharedStore.connect(name, locks)
+        arr = np.zeros(50_000, dtype=np.uint8)  # 50KB each
+        for j in range(5):
+            s.put(f"gw{worker_id}_k{j}", arr)
+        # Verify
+        for j in range(5):
+            result = s.get(f"gw{worker_id}_k{j}")
+            if result is None or result.shape != arr.shape:
+                done_flag.value = -1
+                s.close()
+                return
+        s.close()
+        done_flag.value = 1
+    except Exception:
+        done_flag.value = -1
+
+
+def test_concurrent_chunk_growth(store):
+    """Multiple child processes writing data that triggers chunk growth."""
+    n_workers = 4
+    flags = [multiprocessing.Value("i", 0) for _ in range(n_workers)]
+    procs = []
+
+    for i in range(n_workers):
+        p = multiprocessing.Process(
+            target=_growth_worker,
+            args=(STORE_NAME, store.locks(), i, flags[i]),
+        )
+        procs.append(p)
+        p.start()
+
+    for p in procs:
+        p.join(timeout=30)
+
+    for i in range(n_workers):
+        assert flags[i].value == 1, f"Growth worker {i} failed"
+
+    info = store.info()
+    assert info["entry_count"] == 20  # 4 workers × 5 keys

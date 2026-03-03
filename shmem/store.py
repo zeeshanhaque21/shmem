@@ -2,6 +2,9 @@
 
 Provides put/get/delete for numpy arrays and raw bytes with zero-copy reads.
 Uses a readers-writers lock for safe multi-process access.
+
+The store is split into a control block (header + index) and separate data
+chunks that are allocated on demand, making it elastic.
 """
 
 import ctypes
@@ -16,38 +19,45 @@ from .layout import (
     MAGIC,
     VERSION,
     HEADER_SIZE,
+    CHUNK_HEADER_SIZE,
     INDEX_ENTRY_SIZE,
     BLOCK_HEADER_SIZE,
-    StoreHeader,
-    compute_offsets,
+    compute_control_size,
 )
 from .allocator import BlockAllocator
 from .index import HashIndex
-from .errors import StoreCorruptedError
+from .errors import OutOfMemoryError, StoreCorruptedError
 
 
 LOCK_TIMEOUT = 5.0  # seconds
 
 # Field offsets within StoreHeader (packed, _pack_=1):
-#   magic:          offset  0, uint32  (4)
-#   version:        offset  4, uint32  (4)
-#   max_entries:    offset  8, uint32  (4)
-#   entry_count:    offset 12, uint32  (4)
-#   index_offset:   offset 16, uint64  (8)
-#   data_offset:    offset 24, uint64  (8)
-#   data_size:      offset 32, uint64  (8)
-#   free_list_head: offset 40, int64   (8)
-#   readers_count:  offset 48, int32   (4)
-#   _pad:           offset 52, 12 bytes
+#   magic:           offset  0, uint32  (4)
+#   version:         offset  4, uint32  (4)
+#   max_entries:     offset  8, uint32  (4)
+#   entry_count:     offset 12, uint32  (4)
+#   index_offset:    offset 16, uint64  (8)
+#   chunk_data_size: offset 24, uint64  (8)
+#   chunk_count:     offset 32, uint32  (4)
+#   _reserved:       offset 36, uint32  (4)
+#   _unused:         offset 40, int64   (8)
+#   readers_count:   offset 48, int32   (4)
+#   _pad:            offset 52, 12 bytes
 _OFF_MAGIC = 0
 _OFF_VERSION = 4
 _OFF_MAX_ENTRIES = 8
 _OFF_ENTRY_COUNT = 12
 _OFF_INDEX_OFFSET = 16
-_OFF_DATA_OFFSET = 24
-_OFF_DATA_SIZE = 32
-_OFF_FREE_LIST_HEAD = 40
+_OFF_CHUNK_DATA_SIZE = 24
+_OFF_CHUNK_COUNT = 32
 _OFF_READERS_COUNT = 48
+
+# ChunkHeader field offsets (within each data chunk SharedMemory):
+#   free_list_head: offset 0, int64  (8)
+#   data_size:      offset 8, uint64 (8)
+#   _pad:           offset 16, 16 bytes
+_COFF_FREE_LIST_HEAD = 0
+_COFF_DATA_SIZE = 8
 
 
 @dataclass
@@ -59,7 +69,7 @@ class StoreLocks:
 
 
 class _HeaderFields:
-    """Field-level access to header fields in shared memory.
+    """Field-level access to header fields in the control block shared memory.
 
     Uses struct.pack_into / unpack_from to read/write individual fields,
     avoiding read-modify-write races on the full 64-byte header.
@@ -85,20 +95,62 @@ class _HeaderFields:
     def set_entry_count(self, value: int) -> None:
         struct.pack_into("<I", self._buf, _OFF_ENTRY_COUNT, value)
 
-    def get_data_size(self) -> int:
-        return struct.unpack_from("<Q", self._buf, _OFF_DATA_SIZE)[0]
+    def get_chunk_data_size(self) -> int:
+        return struct.unpack_from("<Q", self._buf, _OFF_CHUNK_DATA_SIZE)[0]
 
-    def get_free_list_head(self) -> int:
-        return struct.unpack_from("<q", self._buf, _OFF_FREE_LIST_HEAD)[0]
+    def get_chunk_count(self) -> int:
+        return struct.unpack_from("<I", self._buf, _OFF_CHUNK_COUNT)[0]
 
-    def set_free_list_head(self, value: int) -> None:
-        struct.pack_into("<q", self._buf, _OFF_FREE_LIST_HEAD, value)
+    def set_chunk_count(self, value: int) -> None:
+        struct.pack_into("<I", self._buf, _OFF_CHUNK_COUNT, value)
 
     def get_readers_count(self) -> int:
         return struct.unpack_from("<i", self._buf, _OFF_READERS_COUNT)[0]
 
     def set_readers_count(self, value: int) -> None:
         struct.pack_into("<i", self._buf, _OFF_READERS_COUNT, value)
+
+    # -- bulk write (only used during init) -----------------------------------
+
+    def init_all(
+        self,
+        magic: int,
+        version: int,
+        max_entries: int,
+        index_offset: int,
+        chunk_data_size: int,
+    ) -> None:
+        """Write all header fields at once (used only at creation time)."""
+        struct.pack_into("<I", self._buf, _OFF_MAGIC, magic)
+        struct.pack_into("<I", self._buf, _OFF_VERSION, version)
+        struct.pack_into("<I", self._buf, _OFF_MAX_ENTRIES, max_entries)
+        struct.pack_into("<I", self._buf, _OFF_ENTRY_COUNT, 0)
+        struct.pack_into("<Q", self._buf, _OFF_INDEX_OFFSET, index_offset)
+        struct.pack_into("<Q", self._buf, _OFF_CHUNK_DATA_SIZE, chunk_data_size)
+        struct.pack_into("<I", self._buf, _OFF_CHUNK_COUNT, 0)
+        struct.pack_into("<i", self._buf, _OFF_READERS_COUNT, 0)
+
+
+class _ChunkHeaderFields:
+    """Field-level access to a ChunkHeader in a data chunk's shared memory.
+
+    Also implements the callable interface expected by the BlockAllocator
+    for free_list_head get/set.
+    """
+
+    def __init__(self, buf):
+        self._buf = buf
+
+    def get_free_list_head(self) -> int:
+        return struct.unpack_from("<q", self._buf, _COFF_FREE_LIST_HEAD)[0]
+
+    def set_free_list_head(self, value: int) -> None:
+        struct.pack_into("<q", self._buf, _COFF_FREE_LIST_HEAD, value)
+
+    def init(self, data_size: int) -> None:
+        """Initialize the chunk header fields."""
+        struct.pack_into("<q", self._buf, _COFF_FREE_LIST_HEAD, -1)
+        struct.pack_into("<Q", self._buf, _COFF_DATA_SIZE, data_size)
 
     # -- callable interface for the allocator ---------------------------------
 
@@ -114,91 +166,87 @@ class _HeaderFields:
     def set(self, value: int) -> None:
         self.set_free_list_head(value)
 
-    # -- bulk write (only used during init) -----------------------------------
 
-    def init_all(
-        self,
-        magic: int,
-        version: int,
-        max_entries: int,
-        index_offset: int,
-        data_offset: int,
-        data_size: int,
-    ) -> None:
-        """Write all header fields at once (used only at creation time)."""
-        struct.pack_into("<I", self._buf, _OFF_MAGIC, magic)
-        struct.pack_into("<I", self._buf, _OFF_VERSION, version)
-        struct.pack_into("<I", self._buf, _OFF_MAX_ENTRIES, max_entries)
-        struct.pack_into("<I", self._buf, _OFF_ENTRY_COUNT, 0)
-        struct.pack_into("<Q", self._buf, _OFF_INDEX_OFFSET, index_offset)
-        struct.pack_into("<Q", self._buf, _OFF_DATA_OFFSET, data_offset)
-        struct.pack_into("<Q", self._buf, _OFF_DATA_SIZE, data_size)
-        struct.pack_into("<q", self._buf, _OFF_FREE_LIST_HEAD, -1)
-        struct.pack_into("<i", self._buf, _OFF_READERS_COUNT, 0)
+@dataclass
+class _ChunkInfo:
+    """Per-chunk state."""
+
+    shm: shared_memory.SharedMemory
+    buf: memoryview
+    data_buf: memoryview
+    allocator: BlockAllocator
+    chunk_hdr: _ChunkHeaderFields
 
 
 class SharedStore:
     """Zero-copy shared memory key-value store for numpy arrays and raw bytes.
 
     Use ``create()`` in the parent process and ``connect()`` in child processes.
+    The store automatically grows by allocating new data chunks on demand.
     """
 
     def __init__(
         self,
-        shm: shared_memory.SharedMemory,
+        ctrl_shm: shared_memory.SharedMemory,
         max_entries: int,
         locks: StoreLocks,
         *,
         is_creator: bool = False,
+        name: str,
+        chunk_data_size: int,
     ):
-        self._shm = shm
+        self._ctrl_shm = ctrl_shm
         self._max_entries = max_entries
         self._locks = locks
         self._is_creator = is_creator
+        self._name = name
+        self._chunk_data_size = chunk_data_size
 
-        self._buf: memoryview = shm.buf
+        self._ctrl_buf: memoryview = ctrl_shm.buf
 
-        # Map sub-regions
-        index_offset, data_offset = compute_offsets(max_entries)
-        data_size = len(self._buf) - data_offset
+        # Map sub-regions of the control block
+        index_offset = HEADER_SIZE
+        self._index_buf = self._ctrl_buf[index_offset : index_offset + max_entries * INDEX_ENTRY_SIZE]
 
-        self._index_buf = self._buf[index_offset : index_offset + max_entries * INDEX_ENTRY_SIZE]
-        self._data_buf = self._buf[data_offset : data_offset + data_size]
-
-        self._hdr = _HeaderFields(self._buf)
+        self._hdr = _HeaderFields(self._ctrl_buf)
         self._index = HashIndex(self._index_buf, max_entries)
-        self._allocator = BlockAllocator(self._data_buf)
 
-        self._data_offset = data_offset
+        self._chunks: list[_ChunkInfo | None] = []
 
     @classmethod
     def create(
         cls,
         name: str,
-        size_mb: int = 256,
+        chunk_size_mb: int = 64,
         max_entries: int = 1024,
     ) -> "SharedStore":
         """Create a new shared memory store (call from the parent process)."""
-        index_offset, data_offset = compute_offsets(max_entries)
-        total_size = data_offset + size_mb * 1024 * 1024
+        control_size = compute_control_size(max_entries)
+        chunk_data_size = chunk_size_mb * 1024 * 1024
 
-        shm = shared_memory.SharedMemory(name=name, create=True, size=total_size)
+        ctrl_shm = shared_memory.SharedMemory(name=name, create=True, size=control_size)
 
         locks = StoreLocks(
             write_lock=multiprocessing.Lock(),
             read_lock=multiprocessing.Lock(),
         )
 
-        store = cls(shm, max_entries, locks, is_creator=True)
+        store = cls(
+            ctrl_shm, max_entries, locks,
+            is_creator=True,
+            name=name,
+            chunk_data_size=chunk_data_size,
+        )
         store._hdr.init_all(
             magic=MAGIC,
             version=VERSION,
             max_entries=max_entries,
-            index_offset=index_offset,
-            data_offset=data_offset,
-            data_size=total_size - data_offset,
+            index_offset=HEADER_SIZE,
+            chunk_data_size=chunk_data_size,
         )
-        store._allocator.init(store._hdr)
+
+        # Create the first data chunk
+        store._create_chunk()
 
         return store
 
@@ -207,19 +255,97 @@ class SharedStore:
         cls,
         name: str,
         locks: StoreLocks,
-        max_entries: int = 1024,
     ) -> "SharedStore":
-        """Attach to an existing shared memory store (call from child processes)."""
-        shm = shared_memory.SharedMemory(name=name, create=False)
+        """Attach to an existing shared memory store (call from child processes).
 
-        store = cls(shm, max_entries, locks, is_creator=False)
+        Reads max_entries and chunk_data_size from the header, so the caller
+        does not need to specify them.
+        """
+        ctrl_shm = shared_memory.SharedMemory(name=name, create=False)
+        buf = ctrl_shm.buf
+
+        # Read header fields to discover configuration
+        max_entries = struct.unpack_from("<I", buf, _OFF_MAX_ENTRIES)[0]
+        chunk_data_size = struct.unpack_from("<Q", buf, _OFF_CHUNK_DATA_SIZE)[0]
+        chunk_count = struct.unpack_from("<I", buf, _OFF_CHUNK_COUNT)[0]
+
+        store = cls(
+            ctrl_shm, max_entries, locks,
+            is_creator=False,
+            name=name,
+            chunk_data_size=chunk_data_size,
+        )
         store._verify_header()
+
+        # Open all existing chunks
+        for i in range(chunk_count):
+            store._open_chunk(i)
 
         return store
 
     def locks(self) -> StoreLocks:
         """Return the StoreLocks for passing to child processes."""
         return self._locks
+
+    # -- Chunk management -----------------------------------------------------
+
+    def _open_chunk(self, i: int) -> _ChunkInfo:
+        """Open an existing data chunk by index."""
+        chunk_name = f"{self._name}_{i}"
+        shm = shared_memory.SharedMemory(name=chunk_name, create=False)
+        buf = shm.buf
+        data_buf = buf[CHUNK_HEADER_SIZE:]
+        chunk_hdr = _ChunkHeaderFields(buf)
+        allocator = BlockAllocator(data_buf)
+
+        info = _ChunkInfo(
+            shm=shm,
+            buf=buf,
+            data_buf=data_buf,
+            allocator=allocator,
+            chunk_hdr=chunk_hdr,
+        )
+
+        # Extend list if needed and set at index i
+        while len(self._chunks) <= i:
+            self._chunks.append(None)
+        self._chunks[i] = info
+        return info
+
+    def _create_chunk(self) -> _ChunkInfo:
+        """Create a new data chunk and initialize its allocator."""
+        i = self._hdr.get_chunk_count()
+        chunk_name = f"{self._name}_{i}"
+        chunk_total_size = CHUNK_HEADER_SIZE + self._chunk_data_size
+
+        shm = shared_memory.SharedMemory(name=chunk_name, create=True, size=chunk_total_size)
+        buf = shm.buf
+        data_buf = buf[CHUNK_HEADER_SIZE:]
+        chunk_hdr = _ChunkHeaderFields(buf)
+        chunk_hdr.init(self._chunk_data_size)
+        allocator = BlockAllocator(data_buf)
+        allocator.init(chunk_hdr)
+
+        info = _ChunkInfo(
+            shm=shm,
+            buf=buf,
+            data_buf=data_buf,
+            allocator=allocator,
+            chunk_hdr=chunk_hdr,
+        )
+
+        while len(self._chunks) <= i:
+            self._chunks.append(None)
+        self._chunks[i] = info
+
+        self._hdr.set_chunk_count(i + 1)
+        return info
+
+    def _ensure_chunk(self, i: int) -> _ChunkInfo:
+        """Lazily open chunk i if not yet in the local list."""
+        if i < len(self._chunks) and self._chunks[i] is not None:
+            return self._chunks[i]
+        return self._open_chunk(i)
 
     # -- Header helpers -------------------------------------------------------
 
@@ -238,6 +364,16 @@ class SharedStore:
     def _update_entry_count(self, delta: int) -> None:
         cur = self._hdr.get_entry_count()
         self._hdr.set_entry_count(max(0, cur + delta))
+
+    # -- Virtual offset encoding/decoding ------------------------------------
+
+    def _encode_offset(self, chunk_index: int, local_offset: int) -> int:
+        """Encode chunk index and local offset into a virtual offset."""
+        return chunk_index * self._chunk_data_size + local_offset
+
+    def _decode_offset(self, virtual_offset: int) -> tuple[int, int]:
+        """Decode a virtual offset into (chunk_index, local_offset)."""
+        return divmod(virtual_offset, self._chunk_data_size)
 
     # -- Readers-writers lock -------------------------------------------------
 
@@ -292,33 +428,65 @@ class SharedStore:
         dtype_str = data.dtype.str
         shape = data.shape
 
+        if nbytes > self._chunk_data_size:
+            raise OutOfMemoryError(
+                f"Value too large ({nbytes} bytes) for chunk_data_size "
+                f"({self._chunk_data_size} bytes). Use a larger chunk_size_mb."
+            )
+
         # If key exists, free old block first
         old_entry = self._index.find(key)
         if old_entry is not None:
-            old_block_off = old_entry.data_offset - BLOCK_HEADER_SIZE
-            self._allocator.deallocate(
+            chunk_idx, local_payload_off = self._decode_offset(old_entry.data_offset)
+            chunk = self._ensure_chunk(chunk_idx)
+            old_block_off = local_payload_off - BLOCK_HEADER_SIZE
+            chunk.allocator.deallocate(
                 old_block_off,
-                self._hdr.get(),
-                self._hdr,
+                chunk.chunk_hdr.get(),
+                chunk.chunk_hdr,
             )
             self._update_entry_count(-1)
 
-        # Allocate new block
-        block_off = self._allocator.allocate(
-            nbytes,
-            self._hdr.get(),
-            self._hdr,
-        )
+        # Try allocating from each existing chunk
+        block_off = None
+        alloc_chunk_idx = None
+        for ci in range(self._hdr.get_chunk_count()):
+            chunk = self._ensure_chunk(ci)
+            try:
+                block_off = chunk.allocator.allocate(
+                    nbytes,
+                    chunk.chunk_hdr.get(),
+                    chunk.chunk_hdr,
+                )
+                alloc_chunk_idx = ci
+                break
+            except OutOfMemoryError:
+                continue
+
+        # If all chunks are full, create a new one and retry
+        if block_off is None:
+            new_chunk = self._create_chunk()
+            alloc_chunk_idx = self._hdr.get_chunk_count() - 1
+            block_off = new_chunk.allocator.allocate(
+                nbytes,
+                new_chunk.chunk_hdr.get(),
+                new_chunk.chunk_hdr,
+            )
+
+        chunk = self._chunks[alloc_chunk_idx]
 
         # Copy data into the block (after the block header)
-        payload_off = block_off + BLOCK_HEADER_SIZE
-        dest = np.ndarray(data.shape, dtype=data.dtype, buffer=self._data_buf, offset=payload_off)
+        local_payload_off = block_off + BLOCK_HEADER_SIZE
+        dest = np.ndarray(data.shape, dtype=data.dtype, buffer=chunk.data_buf, offset=local_payload_off)
         np.copyto(dest, data)
+
+        # Encode virtual offset
+        virtual_offset = self._encode_offset(alloc_chunk_idx, local_payload_off)
 
         # Update index
         self._index.insert(
             key,
-            data_offset=payload_off,
+            data_offset=virtual_offset,
             data_size=nbytes,
             dtype_str=dtype_str,
             ndim=len(shape),
@@ -350,12 +518,15 @@ class SharedStore:
         if entry is None:
             return None
 
+        chunk_idx, local_offset = self._decode_offset(entry.data_offset)
+        chunk = self._ensure_chunk(chunk_idx)
+
         dtype = np.dtype(entry.dtype_str.rstrip(b"\x00"))
         arr = np.ndarray(
             entry.shape,
             dtype=dtype,
-            buffer=self._data_buf,
-            offset=entry.data_offset,
+            buffer=chunk.data_buf,
+            offset=local_offset,
         )
 
         if not writable:
@@ -374,33 +545,62 @@ class SharedStore:
     def _put_bytes_impl(self, key: str, data: bytes | bytearray | memoryview) -> None:
         nbytes = len(data)
 
+        if nbytes > self._chunk_data_size:
+            raise OutOfMemoryError(
+                f"Value too large ({nbytes} bytes) for chunk_data_size "
+                f"({self._chunk_data_size} bytes). Use a larger chunk_size_mb."
+            )
+
         # Free old block if key exists
         old_entry = self._index.find(key)
         if old_entry is not None:
-            old_block_off = old_entry.data_offset - BLOCK_HEADER_SIZE
-            self._allocator.deallocate(
+            chunk_idx, local_payload_off = self._decode_offset(old_entry.data_offset)
+            chunk = self._ensure_chunk(chunk_idx)
+            old_block_off = local_payload_off - BLOCK_HEADER_SIZE
+            chunk.allocator.deallocate(
                 old_block_off,
-                self._hdr.get(),
-                self._hdr,
+                chunk.chunk_hdr.get(),
+                chunk.chunk_hdr,
             )
             self._update_entry_count(-1)
 
-        # Allocate
-        block_off = self._allocator.allocate(
-            nbytes,
-            self._hdr.get(),
-            self._hdr,
-        )
+        # Try allocating from each existing chunk
+        block_off = None
+        alloc_chunk_idx = None
+        for ci in range(self._hdr.get_chunk_count()):
+            chunk = self._ensure_chunk(ci)
+            try:
+                block_off = chunk.allocator.allocate(
+                    nbytes,
+                    chunk.chunk_hdr.get(),
+                    chunk.chunk_hdr,
+                )
+                alloc_chunk_idx = ci
+                break
+            except OutOfMemoryError:
+                continue
 
-        payload_off = block_off + BLOCK_HEADER_SIZE
+        if block_off is None:
+            new_chunk = self._create_chunk()
+            alloc_chunk_idx = self._hdr.get_chunk_count() - 1
+            block_off = new_chunk.allocator.allocate(
+                nbytes,
+                new_chunk.chunk_hdr.get(),
+                new_chunk.chunk_hdr,
+            )
+
+        chunk = self._chunks[alloc_chunk_idx]
+        local_payload_off = block_off + BLOCK_HEADER_SIZE
 
         # Copy bytes in
-        self._data_buf[payload_off : payload_off + nbytes] = data
+        chunk.data_buf[local_payload_off : local_payload_off + nbytes] = data
+
+        virtual_offset = self._encode_offset(alloc_chunk_idx, local_payload_off)
 
         # Index with empty dtype (signals raw bytes)
         self._index.insert(
             key,
-            data_offset=payload_off,
+            data_offset=virtual_offset,
             data_size=nbytes,
             dtype_str="",
             ndim=0,
@@ -415,7 +615,9 @@ class SharedStore:
             entry = self._index.find(key)
             if entry is None:
                 return None
-            return self._data_buf[entry.data_offset : entry.data_offset + entry.data_size]
+            chunk_idx, local_offset = self._decode_offset(entry.data_offset)
+            chunk = self._ensure_chunk(chunk_idx)
+            return chunk.data_buf[local_offset : local_offset + entry.data_size]
         finally:
             self._release_read()
 
@@ -432,11 +634,13 @@ class SharedStore:
         if entry is None:
             return False
 
-        block_off = entry.data_offset - BLOCK_HEADER_SIZE
-        self._allocator.deallocate(
+        chunk_idx, local_payload_off = self._decode_offset(entry.data_offset)
+        chunk = self._ensure_chunk(chunk_idx)
+        block_off = local_payload_off - BLOCK_HEADER_SIZE
+        chunk.allocator.deallocate(
             block_off,
-            self._hdr.get(),
-            self._hdr,
+            chunk.chunk_hdr.get(),
+            chunk.chunk_hdr,
         )
         self._update_entry_count(-1)
         return True
@@ -450,36 +654,74 @@ class SharedStore:
             self._release_read()
 
     def info(self) -> dict:
-        """Return usage statistics."""
+        """Return usage statistics aggregated across all chunks."""
         self._acquire_read()
         try:
-            alloc_stats = self._allocator.stats(self._hdr.get())
+            total_bytes = 0
+            used_bytes = 0
+            free_bytes = 0
+            used_blocks = 0
+            free_blocks = 0
+            largest_free = 0
+
+            chunk_count = self._hdr.get_chunk_count()
+            for ci in range(chunk_count):
+                chunk = self._ensure_chunk(ci)
+                stats = chunk.allocator.stats(chunk.chunk_hdr.get())
+                total_bytes += stats["total_bytes"]
+                used_bytes += stats["used_bytes"]
+                free_bytes += stats["free_bytes"]
+                used_blocks += stats["used_blocks"]
+                free_blocks += stats["free_blocks"]
+                if stats["largest_free_payload"] > largest_free:
+                    largest_free = stats["largest_free_payload"]
+
             return {
-                "name": self._shm.name,
-                "total_shm_bytes": len(self._buf),
+                "name": self._name,
                 "max_entries": self._hdr.get_max_entries(),
                 "entry_count": self._hdr.get_entry_count(),
-                **alloc_stats,
+                "chunk_count": chunk_count,
+                "chunk_data_size": self._chunk_data_size,
+                "total_bytes": total_bytes,
+                "used_bytes": used_bytes,
+                "free_bytes": free_bytes,
+                "used_blocks": used_blocks,
+                "free_blocks": free_blocks,
+                "largest_free_payload": largest_free,
             }
         finally:
             self._release_read()
 
     def _release_buffers(self) -> None:
         """Release all memoryview references so the underlying mmap can be closed."""
+        for chunk in self._chunks:
+            if chunk is not None:
+                chunk.data_buf = None
+                chunk.buf = None
+                chunk.allocator = None
+                chunk.chunk_hdr = None
+        self._chunks = []
         self._index_buf = None
-        self._data_buf = None
-        self._buf = None
+        self._ctrl_buf = None
         self._index = None
-        self._allocator = None
         self._hdr = None
 
     def close(self) -> None:
         """Detach from shared memory (does not destroy it)."""
+        chunks = list(self._chunks)
         self._release_buffers()
-        self._shm.close()
+        for chunk in chunks:
+            if chunk is not None:
+                chunk.shm.close()
+        self._ctrl_shm.close()
 
     def destroy(self) -> None:
-        """Unlink (delete) the shared memory segment. Only the creator should call this."""
+        """Unlink (delete) the shared memory segments. Only the creator should call this."""
+        chunks = list(self._chunks)
         self._release_buffers()
-        self._shm.close()
-        self._shm.unlink()
+        for chunk in chunks:
+            if chunk is not None:
+                chunk.shm.close()
+                chunk.shm.unlink()
+        self._ctrl_shm.close()
+        self._ctrl_shm.unlink()

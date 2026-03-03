@@ -164,7 +164,7 @@ def bench_shared_array_latency(shape, image):
 
 
 def bench_shmem_latency(shape, image):
-    store = SharedStore.create(STORE_NAME, size_mb=STORE_SIZE_MB, max_entries=64)
+    store = SharedStore.create(STORE_NAME, chunk_size_mb=STORE_SIZE_MB, max_entries=64)
 
     write_times = []
     read_times = []
@@ -306,8 +306,8 @@ def bench_sa_throughput(shape):
     return n / elapsed, elapsed, n
 
 
-def _shmem_producer(store_name, locks, max_entries, shape, ready, start, n):
-    store = SharedStore.connect(store_name, locks, max_entries)
+def _shmem_producer(store_name, locks, shape, ready, start, n):
+    store = SharedStore.connect(store_name, locks)
     frame = make_image(shape)
     ready.set()
     start.wait()
@@ -316,8 +316,8 @@ def _shmem_producer(store_name, locks, max_entries, shape, ready, start, n):
     store.close()
 
 
-def _shmem_consumer(store_name, locks, max_entries, shape, ready, start, done, n):
-    store = SharedStore.connect(store_name, locks, max_entries)
+def _shmem_consumer(store_name, locks, shape, ready, start, done, n):
+    store = SharedStore.connect(store_name, locks)
     sink = np.empty(shape, dtype=DTYPE)
     ready.set()
     start.wait()
@@ -331,7 +331,7 @@ def _shmem_consumer(store_name, locks, max_entries, shape, ready, start, done, n
 
 
 def bench_shmem_throughput(shape):
-    store = SharedStore.create(STORE_NAME, size_mb=STORE_SIZE_MB, max_entries=64)
+    store = SharedStore.create(STORE_NAME, chunk_size_mb=STORE_SIZE_MB, max_entries=64)
     # Pre-populate so consumer never sees None
     store.put("frame", make_image(shape))
 
@@ -342,11 +342,11 @@ def bench_shmem_throughput(shape):
     try:
         p = mp.Process(
             target=_shmem_producer,
-            args=(STORE_NAME, store.locks(), 64, shape, prod_ready, start, n),
+            args=(STORE_NAME, store.locks(), shape, prod_ready, start, n),
         )
         c = mp.Process(
             target=_shmem_consumer,
-            args=(STORE_NAME, store.locks(), 64, shape, cons_ready, start, done, n),
+            args=(STORE_NAME, store.locks(), shape, cons_ready, start, done, n),
         )
         p.start()
         c.start()

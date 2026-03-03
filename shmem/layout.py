@@ -1,7 +1,11 @@
 """ctypes.Structure definitions mapped directly onto the shared memory buffer.
 
-Memory layout (contiguous):
-  [StoreHeader 64B] [IndexEntry × N, each 256B] [Data region: BlockHeader+payload ...]
+Memory layout (multi-chunk):
+  Control Block: "{name}"
+    [StoreHeader 64B] [IndexEntry × N, each 256B]
+
+  Data Chunk i: "{name}_{i}"
+    [ChunkHeader 32B] [Data region: BlockHeader+payload ...]
 """
 
 import ctypes
@@ -9,9 +13,10 @@ import ctypes
 # -- Constants ----------------------------------------------------------------
 
 MAGIC = 0x534D4B56  # "SMKV"
-VERSION = 1
+VERSION = 2
 
 HEADER_SIZE = 64
+CHUNK_HEADER_SIZE = 32
 INDEX_ENTRY_SIZE = 256
 BLOCK_HEADER_SIZE = 16
 FREE_BLOCK_LINKS_SIZE = 16
@@ -30,20 +35,32 @@ ENTRY_TOMBSTONE = 2
 
 
 class StoreHeader(ctypes.Structure):
-    """64-byte header at offset 0 of the shared memory block."""
+    """64-byte header at offset 0 of the control block."""
 
     _pack_ = 1
     _fields_ = [
-        ("magic", ctypes.c_uint32),          # 4   magic number
-        ("version", ctypes.c_uint32),         # 4   format version
-        ("max_entries", ctypes.c_uint32),      # 4   hash table capacity
-        ("entry_count", ctypes.c_uint32),      # 4   number of occupied entries
-        ("index_offset", ctypes.c_uint64),     # 8   byte offset to index region
-        ("data_offset", ctypes.c_uint64),      # 8   byte offset to data region
-        ("data_size", ctypes.c_uint64),        # 8   total bytes in data region
-        ("free_list_head", ctypes.c_int64),    # 8   offset of first free block (-1 = none)
-        ("readers_count", ctypes.c_int32),     # 4   current number of readers
-        ("_pad", ctypes.c_char * 12),          # 12  padding to 64 bytes
+        ("magic", ctypes.c_uint32),            # 4   magic number
+        ("version", ctypes.c_uint32),           # 4   format version
+        ("max_entries", ctypes.c_uint32),        # 4   hash table capacity
+        ("entry_count", ctypes.c_uint32),        # 4   number of occupied entries
+        ("index_offset", ctypes.c_uint64),       # 8   byte offset to index region
+        ("chunk_data_size", ctypes.c_uint64),    # 8   usable bytes per data chunk (excl ChunkHeader)
+        ("chunk_count", ctypes.c_uint32),        # 4   number of allocated data chunks
+        ("_reserved", ctypes.c_uint32),          # 4   padding
+        ("_unused", ctypes.c_int64),             # 8   reserved (was free_list_head)
+        ("readers_count", ctypes.c_int32),       # 4   current number of readers
+        ("_pad", ctypes.c_char * 12),            # 12  padding to 64 bytes
+    ]
+
+
+class ChunkHeader(ctypes.Structure):
+    """32-byte header at offset 0 of each data chunk SharedMemory."""
+
+    _pack_ = 1
+    _fields_ = [
+        ("free_list_head", ctypes.c_int64),    # 8   first free block in this chunk (-1 = none)
+        ("data_size", ctypes.c_uint64),        # 8   usable bytes after ChunkHeader
+        ("_pad", ctypes.c_char * 16),          # 16  reserved
     ]
 
 
@@ -110,6 +127,9 @@ class FreeBlockLinks(ctypes.Structure):
 assert ctypes.sizeof(StoreHeader) == HEADER_SIZE, (
     f"StoreHeader is {ctypes.sizeof(StoreHeader)}B, expected {HEADER_SIZE}B"
 )
+assert ctypes.sizeof(ChunkHeader) == CHUNK_HEADER_SIZE, (
+    f"ChunkHeader is {ctypes.sizeof(ChunkHeader)}B, expected {CHUNK_HEADER_SIZE}B"
+)
 assert ctypes.sizeof(IndexEntry) == INDEX_ENTRY_SIZE, (
     f"IndexEntry is {ctypes.sizeof(IndexEntry)}B, expected {INDEX_ENTRY_SIZE}B"
 )
@@ -121,8 +141,6 @@ assert ctypes.sizeof(FreeBlockLinks) == FREE_BLOCK_LINKS_SIZE, (
 )
 
 
-def compute_offsets(max_entries: int) -> tuple[int, int]:
-    """Return (index_offset, data_offset) for a given hash table capacity."""
-    index_offset = HEADER_SIZE
-    data_offset = index_offset + max_entries * INDEX_ENTRY_SIZE
-    return index_offset, data_offset
+def compute_control_size(max_entries: int) -> int:
+    """Return the total size of the control block (header + index, no data)."""
+    return HEADER_SIZE + max_entries * INDEX_ENTRY_SIZE

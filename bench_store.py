@@ -74,7 +74,7 @@ def format_us(val):
 
 
 def bench_put_get_latency(shape, image):
-    store = SharedStore.create(STORE_NAME, size_mb=STORE_SIZE_MB, max_entries=64)
+    store = SharedStore.create(STORE_NAME, chunk_size_mb=STORE_SIZE_MB, max_entries=64)
 
     put_times = []
     get_times = []
@@ -119,7 +119,7 @@ def bench_put_get_latency(shape, image):
 
 
 def bench_get_bytes_latency():
-    store = SharedStore.create(STORE_NAME, size_mb=STORE_SIZE_MB, max_entries=64)
+    store = SharedStore.create(STORE_NAME, chunk_size_mb=STORE_SIZE_MB, max_entries=64)
     sizes = [64, 1024, 64 * 1024, 1024 * 1024]
     results = {}
 
@@ -154,8 +154,8 @@ def bench_get_bytes_latency():
 # ---------------------------------------------------------------------------
 
 
-def _producer(store_name, locks, max_entries, shape, ready, start, n):
-    store = SharedStore.connect(store_name, locks, max_entries)
+def _producer(store_name, locks, shape, ready, start, n):
+    store = SharedStore.connect(store_name, locks)
     frame = make_image(shape)
     ready.set()
     start.wait()
@@ -164,8 +164,8 @@ def _producer(store_name, locks, max_entries, shape, ready, start, n):
     store.close()
 
 
-def _consumer(store_name, locks, max_entries, shape, ready, start, done, n):
-    store = SharedStore.connect(store_name, locks, max_entries)
+def _consumer(store_name, locks, shape, ready, start, done, n):
+    store = SharedStore.connect(store_name, locks)
     ready.set()
     start.wait()
     for i in range(n):
@@ -179,7 +179,7 @@ def _consumer(store_name, locks, max_entries, shape, ready, start, done, n):
 
 def bench_throughput(shape):
     nbytes = int(np.prod(shape)) * np.dtype(DTYPE).itemsize
-    store = SharedStore.create(STORE_NAME, size_mb=STORE_SIZE_MB, max_entries=64)
+    store = SharedStore.create(STORE_NAME, chunk_size_mb=STORE_SIZE_MB, max_entries=64)
 
     n = THROUGHPUT_FRAMES
     prod_ready, cons_ready = mp.Event(), mp.Event()
@@ -188,11 +188,11 @@ def bench_throughput(shape):
     try:
         p = mp.Process(
             target=_producer,
-            args=(STORE_NAME, store.locks(), 64, shape, prod_ready, start, n),
+            args=(STORE_NAME, store.locks(), shape, prod_ready, start, n),
         )
         c = mp.Process(
             target=_consumer,
-            args=(STORE_NAME, store.locks(), 64, shape, cons_ready, start, done, n),
+            args=(STORE_NAME, store.locks(), shape, cons_ready, start, done, n),
         )
         p.start()
         c.start()
@@ -211,6 +211,128 @@ def bench_throughput(shape):
         store.destroy()
 
     return n / elapsed, elapsed, n
+
+
+# ---------------------------------------------------------------------------
+# 4. Multi-chunk auto-growth
+# ---------------------------------------------------------------------------
+
+# Chunk sizes chosen so that each image size will trigger growth:
+#   720p  (2.8 MB): 4 MB chunk → ~1 image/chunk → growth after 1st unique key
+#   1080p (6.2 MB): 8 MB chunk → ~1 image/chunk → growth after 1st unique key
+#   4K   (24.9 MB): 32 MB chunk → ~1 image/chunk → growth after 1st unique key
+GROWTH_CHUNK_SIZES = {
+    "720p": 4,
+    "1080p": 8,
+    "4K": 32,
+}
+
+GROWTH_N_KEYS = 20  # store this many unique keys (will span many chunks)
+
+
+def bench_multi_chunk_put(shape, image, chunk_size_mb):
+    """Store GROWTH_N_KEYS unique images, measuring each put(). Returns
+    (put_times, n_chunks_created, total_data_mb)."""
+    store = SharedStore.create(STORE_NAME, chunk_size_mb=chunk_size_mb, max_entries=256)
+
+    put_times = []
+
+    try:
+        # Warmup
+        for i in range(WARMUP_ITERS):
+            store.put("warmup", image)
+        store.delete("warmup")
+
+        for i in range(GROWTH_N_KEYS):
+            t0 = time.perf_counter_ns()
+            store.put(f"img_{i}", image)
+            t1 = time.perf_counter_ns()
+            put_times.append((t1 - t0) / 1000)
+
+        info = store.info()
+        n_chunks = info["chunk_count"]
+        total_data_mb = info["total_bytes"] / 1e6
+
+        # Read back from all chunks
+        get_times = []
+        for i in range(GROWTH_N_KEYS):
+            t0 = time.perf_counter_ns()
+            arr = store.get(f"img_{i}")
+            t1 = time.perf_counter_ns()
+            get_times.append((t1 - t0) / 1000)
+        del arr
+
+        for i in range(GROWTH_N_KEYS):
+            store.delete(f"img_{i}")
+
+    finally:
+        store.destroy()
+
+    return put_times, get_times, n_chunks, total_data_mb
+
+
+def _growth_producer(store_name, locks, shape, n_keys, ready, start):
+    store = SharedStore.connect(store_name, locks)
+    frame = make_image(shape)
+    ready.set()
+    start.wait()
+    for i in range(n_keys):
+        store.put(f"frame_{i}", frame)
+    store.close()
+
+
+def _growth_consumer(store_name, locks, n_keys, ready, start, done):
+    store = SharedStore.connect(store_name, locks)
+    ready.set()
+    start.wait()
+    # Wait for all keys to appear, then read them all
+    for i in range(n_keys):
+        while True:
+            arr = store.get(f"frame_{i}")
+            if arr is not None:
+                break
+    done.set()
+    store.close()
+
+
+def bench_multi_chunk_throughput(shape, chunk_size_mb):
+    nbytes = int(np.prod(shape)) * np.dtype(DTYPE).itemsize
+    n_keys = GROWTH_N_KEYS
+    store = SharedStore.create(STORE_NAME, chunk_size_mb=chunk_size_mb, max_entries=256)
+
+    prod_ready, cons_ready = mp.Event(), mp.Event()
+    start, done = mp.Event(), mp.Event()
+
+    try:
+        p = mp.Process(
+            target=_growth_producer,
+            args=(STORE_NAME, store.locks(), shape, n_keys, prod_ready, start),
+        )
+        c = mp.Process(
+            target=_growth_consumer,
+            args=(STORE_NAME, store.locks(), n_keys, cons_ready, start, done),
+        )
+        p.start()
+        c.start()
+        prod_ready.wait()
+        cons_ready.wait()
+
+        t0 = time.perf_counter()
+        start.set()
+        done.wait()
+        t1 = time.perf_counter()
+
+        p.join(timeout=30)
+        c.join(timeout=30)
+        elapsed = t1 - t0
+
+        info = store.info()
+        n_chunks = info["chunk_count"]
+    finally:
+        store.destroy()
+
+    fps = n_keys / elapsed
+    return fps, elapsed, n_keys, n_chunks
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +408,53 @@ def run_throughput():
         print(f"  {'SharedStore':<25} {fps:>10.1f} {elapsed:>10.3f} {bw:>11.2f} GB/s")
 
 
+def run_multi_chunk():
+    print("\n" + "=" * 80)
+    print("MULTI-CHUNK AUTO-GROWTH  (small chunks, many unique keys)")
+    print(f"  Keys: {GROWTH_N_KEYS}  |  Warmup: {WARMUP_ITERS}")
+    print("=" * 80)
+
+    for size_name, shape in IMAGE_SIZES.items():
+        nbytes = int(np.prod(shape)) * np.dtype(DTYPE).itemsize
+        chunk_mb = GROWTH_CHUNK_SIZES[size_name]
+        image = make_image(shape)
+        print(f"\n  {size_name} ({shape[1]}x{shape[0]}x{shape[2]}) = {nbytes / 1e6:.1f} MB"
+              f"  |  chunk_size = {chunk_mb} MB\n")
+
+        put_t, get_t, n_chunks, total_mb = bench_multi_chunk_put(shape, image, chunk_mb)
+        print(f"  Chunks allocated: {n_chunks}  |  Total data region: {total_mb:.1f} MB\n")
+
+        header = f"  {'Operation':<25} {'Median':>12} {'p99':>12} {'Min':>12}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for label, t in [("put() [with growth]", put_t), ("get() [cross-chunk]", get_t)]:
+            med = statistics.median(t)
+            p99 = percentile(t, 99)
+            mn = min(t)
+            print(f"  {label:<25} {format_us(med)} {format_us(p99)} {format_us(mn)}")
+
+
+def run_multi_chunk_throughput():
+    print("\n" + "=" * 80)
+    print("MULTI-CHUNK CROSS-PROCESS THROUGHPUT  (auto-growth under load)")
+    print(f"  Keys: {GROWTH_N_KEYS}")
+    print("=" * 80)
+
+    for size_name, shape in IMAGE_SIZES.items():
+        nbytes = int(np.prod(shape)) * np.dtype(DTYPE).itemsize
+        chunk_mb = GROWTH_CHUNK_SIZES[size_name]
+        print(f"\n  {size_name} ({shape[1]}x{shape[0]}x{shape[2]}) = {nbytes / 1e6:.1f} MB"
+              f"  |  chunk_size = {chunk_mb} MB\n")
+
+        header = f"  {'Method':<25} {'FPS':>10} {'Time (s)':>10} {'Chunks':>8}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        fps, elapsed, n, n_chunks = bench_multi_chunk_throughput(shape, chunk_mb)
+        print(f"  {'SharedStore (growth)':<25} {fps:>10.1f} {elapsed:>10.3f} {n_chunks:>8}")
+
+
 def main():
     print()
     print("  SharedStore Benchmark")
@@ -296,6 +465,8 @@ def main():
     run_latency()
     run_get_bytes()
     run_throughput()
+    run_multi_chunk()
+    run_multi_chunk_throughput()
 
     print("\n" + "=" * 80)
     print("NOTES")
@@ -306,6 +477,8 @@ def main():
   - get_bytes() = key lookup + slice, returns zero-copy memoryview
   - Throughput = producer calls put(), consumer calls get() in a loop.
     Includes lock acquisition overhead for each operation.
+  - Multi-chunk: small chunk sizes force auto-growth; each put() that exceeds
+    the current chunk creates a new shared memory segment on demand.
 """)
 
 
